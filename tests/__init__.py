@@ -1,0 +1,1 @@
+"""CallMind isolated test suites."""

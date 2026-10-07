@@ -1,0 +1,6 @@
+.st-key-call_phone_mask label{display:block;font-size:14px;color:#182230;margin-bottom:8px}
+.st-key-call_phone_mask input{box-sizing:border-box;width:100%;min-height:44px;border:1px solid transparent;border-radius:8px;background:#f5f6f8;color:#182230;padding:10px 12px;font:inherit}
+.st-key-call_phone_mask input:focus{outline:3px solid #315b91;outline-offset:2px}
+.st-key-call_phone_mask input[aria-invalid="true"]{border-color:#b5202b}
+.st-key-call_phone_mask #phone-help{font-size:13px;line-height:1.5;color:#485566;margin-top:6px}
+.st-key-call_phone_mask #phone-error{font-size:14px;color:#b5202b;line-height:1.5;margin-top:4px;overflow-wrap:anywhere}

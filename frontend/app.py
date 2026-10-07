@@ -1,0 +1,303 @@
+
+import sys
+import os
+import tempfile
+from datetime import datetime, time
+from pathlib import Path
+import streamlit as st
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from database import init_db
+from services.storage import (save_call, get_call, get_recent_calls, get_agreements,
+    get_clients, get_client_calls, set_agreement_status, enrich_agreements,
+    update_agreement, update_call, get_revisions)
+from services.settings import get_settings, save_settings
+from services.dates import local_now, is_overdue
+from services.exports import agreements_csv, calendar_ics
+from services.phones import normalize_masked_phone, display_phone
+from frontend.phone_input import phone_input
+from services.integrations import connection_status, sync_agreement, reconcile_bitrix, IntegrationError
+
+from frontend.redesign import (overview, deal_page, analytics_page, render_agreement, render_history,
+    synchronize, goto, open_task, discard_draft)
+
+st.set_page_config(page_title="CallMind · Договорённости", page_icon="📞", layout="wide")
+init_db()
+settings = get_settings()
+from services.crm import start_worker
+start_worker()
+from services.calendar_sync import start_worker as start_calendar_worker
+start_calendar_worker()
+now = local_now(settings["timezone"])
+RESP = {"manager": "Менеджер", "client": "Клиент", "unknown": "Нужна проверка"}
+PRIORITY = {"low": "Низкий", "normal": "Обычный", "high": "Высокий"}
+KIND = {"task": "Задача", "meeting": "Встреча"}
+PROVIDERS = {"bitrix24": "Bitrix24", "google": "Google Calendar"}
+
+st.html("""<style>
+.block-container{max-width:1240px;padding:1.1rem 2rem 3rem}
+[data-testid="stHeader"]{display:none}
+h1,h2,h3{letter-spacing:-.025em;color:#182230}
+p,li,label{overflow-wrap:anywhere} [data-testid="stCaptionContainer"]{opacity:1!important}
+[data-testid="stCaptionContainer"] p{color:#485566!important;opacity:1!important}
+.task-state{display:inline-block;border-radius:5px;padding:4px 7px;font-size:14px;font-weight:600}
+.task-state.late{background:#fff0ef;color:#9e2020}.task-state.done{background:#e9f6ee;color:#21643d}
+.task-state.active{background:#edf3fa;color:#284e7b}
+.stButton button,.stFormSubmitButton button,.stDownloadButton button,.stLinkButton a{min-height:44px;border-radius:8px}
+.st-key-export_actions [data-testid="stHorizontalBlock"]{flex-wrap:wrap}
+.st-key-export_actions [data-testid="stColumn"]:has([data-testid="stDownloadButton"]){flex:0 0 140px!important;width:140px!important;min-width:140px!important}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:3px solid #315B91!important;outline-offset:2px}
+[data-testid="stVerticalBlockBorderWrapper"]{border-color:#dce2e8}
+[data-testid="stRadio"]>div{gap:.35rem 1rem;flex-wrap:wrap}
+.st-key-main_navigation [role="radiogroup"]{display:flex;gap:8px;flex-wrap:wrap;padding:4px 0}
+.st-key-main_navigation [data-testid="stRadioOption"]{margin:0;min-height:44px;padding:0 22px;border:1px solid #e3e6eb;border-radius:10px;background:#f5f6f8;color:#182230;cursor:pointer;transition:background .15s,border-color .15s}
+.st-key-main_navigation [data-testid="stRadioOption"]{display:flex;align-items:center;justify-content:center;box-sizing:border-box}
+.st-key-main_navigation [data-testid="stRadioOption"]>div{gap:0;align-items:center}
+.st-key-main_navigation [data-testid="stRadioOption"]>div>div:first-child:not([data-testid="stMarkdownContainer"]){display:none}
+.st-key-main_navigation [data-testid="stRadioOption"] p{margin:0;font-size:14px;font-weight:600;color:inherit}
+.st-key-main_navigation [data-testid="stRadioOption"]:hover{background:#fff0f1;border-color:#e30611}
+.st-key-main_navigation [data-testid="stRadioOption"][data-selected="true"],.st-key-main_navigation [data-testid="stRadioOption"]:has(input:checked){background:#e30611;border-color:#e30611;color:#fff}
+.st-key-main_navigation [data-testid="stRadioOption"]:has(input:focus-visible){outline:3px solid #315b91;outline-offset:3px}
+@media(prefers-reduced-motion:reduce){.st-key-main_navigation [data-testid="stRadioOption"]{transition:none}}
+@media(max-width:640px){.block-container{padding:.8rem 1rem 2rem;width:100%;min-width:0}
+.st-key-main_navigation .st-key-navigation,.st-key-main_navigation [data-testid="stRadio"]{width:100%}
+.st-key-main_navigation [role="radiogroup"]{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;width:100%}
+.st-key-main_navigation [role="radiogroup"]>div{min-width:0}
+.st-key-main_navigation [data-testid="stRadioOption"]{width:100%;min-width:0;padding:0 8px}
+[data-testid="stHorizontalBlock"]{flex-wrap:wrap;gap:.5rem}
+[data-testid="stColumn"]{min-width:0!important;flex:1 1 100%!important;width:100%!important}
+.st-key-urgency [data-testid="stColumn"]{flex:1 1 30%!important;width:auto!important}
+.st-key-urgency button p{white-space:normal!important;overflow:visible!important;text-overflow:clip!important;font-size:12px!important}
+div[class*="st-key-taskrow_"] [data-testid="stColumn"]:nth-child(2),div[class*="st-key-taskrow_"] [data-testid="stColumn"]:nth-child(3){flex:1 1 45%!important;width:auto!important}
+div[class*="st-key-taskrow_"] [data-testid="stVerticalBlock"]{gap:.5rem}
+[data-testid="stRadio"] label{min-height:44px} .stButton button,.stFormSubmitButton button{width:100%}
+[data-testid="stHorizontalBlock"]:has(button[kind="primary"])>[data-testid="stColumn"]{flex-basis:100%!important}
+}
+</style>""")
+
+def invalidate_risks():
+    for key in list(st.session_state):
+        if key.startswith("risk_"):
+            del st.session_state[key]
+
+
+def fmt(value, date_only=False):
+    return value.strftime("%d.%m.%Y" if date_only else "%d.%m.%Y · %H:%M") if value else "Без срока"
+
+def render_call(call, context):
+    key = f"{context}_call_{call['id']}"
+    st.caption(f"{call['client_name']} · {fmt(call['call_datetime'])}")
+    st.write("**Краткое содержание**")
+    st.write(call["summary"])
+    if call["next_action"]:
+        st.info(f"Следующий шаг: {call['next_action']}")
+    if call["follow_up_required"]:
+        st.caption("Нужен последующий контакт")
+    audio = call.get("audio_path")
+    if audio and Path(audio).is_file():
+        st.audio(audio)
+    agreements = enrich_agreements(call["agreements"])
+    if not agreements:
+        st.info("Договорённости не обнаружены")
+    for item in agreements:
+        if not item["evidence"] or item["evidence"] not in call["transcript"]:
+            st.warning("Цитата не найдена в текущей транскрипции. Проверьте договорённость.")
+        else:
+            segment = next((s for s in call["transcript_segments"] if item["evidence"] in s["text"]), None)
+            if segment and audio and Path(audio).is_file():
+                with st.expander(f"Послушать подтверждение · {segment['start']:.0f} сек."):
+                    st.audio(audio, start_time=int(segment["start"]))
+        render_agreement(item, key)
+    with st.expander("Транскрипция"):
+        st.write(call["transcript"])
+        st.caption("Сегменты исходного распознавания; после ручной правки полный текст может отличаться.")
+        for segment in call["transcript_segments"]:
+            st.write(f"{segment['start']:.1f}–{segment['end']:.1f} сек. · {segment['text']}")
+    with st.expander("Исправить резюме и транскрипцию"):
+        with st.form(f"{key}_edit"):
+            summary = st.text_area("Резюме", call["summary"])
+            transcript = st.text_area("Текст разговора", call["transcript"], height=220)
+            next_action = st.text_input("Следующий шаг", call["next_action"] or "")
+            follow_up = st.checkbox("Нужен последующий контакт", call["follow_up_required"])
+            if st.form_submit_button("Сохранить"):
+                try:
+                    update_call(call["id"], summary=summary, transcript=transcript, next_action=next_action, follow_up_required=follow_up)
+                    invalidate_risks()
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+    with st.expander("История правок звонка"):
+        for revision in get_revisions("call", call["id"]):
+            st.caption(fmt(revision["created_at"]))
+            render_history("call", call["id"])
+            break
+
+
+brand, add = st.columns([5, 1.5], vertical_alignment="center")
+brand.markdown("### CallMind · Тест" if os.getenv("CALLMIND_TEST_MODE") == "1" else "### CallMind")
+add.button("＋ Добавить звонок", type="primary", use_container_width=True,
+    on_click=goto, args=("Звонки",), kwargs={"upload": True, "focused_call": None})
+with st.container(key="main_navigation"):
+    page = st.radio("Раздел", ["Обзор", "Звонки", "Клиенты", "Сделки", "Аналитика", "Настройки"],
+        horizontal=True, key="navigation", label_visibility="collapsed")
+for item_id in sorted(st.session_state.get("dirty_tasks", set())):
+    if page != "Обзор" or st.session_state.get("selected_task") != item_id:
+        st.warning(f"Договорённость #{item_id}: есть несохранённый черновик в этой сессии.")
+        a, b = st.columns(2)
+        a.button("Вернуться к правкам", key=f"resume_{item_id}", on_click=open_task, args=(item_id,))
+        b.button("Отменить черновик", key=f"discard_{item_id}", on_click=discard_draft, args=(item_id,))
+if page == "Обзор":
+    overview()
+elif page == "Сделки":
+    deal_page()
+elif page == "Аналитика":
+    analytics_page()
+elif page == "Звонки" and st.session_state.get("upload"):
+    st.title("Новый звонок")
+    st.caption("Загрузите запись для анализа. Автоматическое получение телефонного аудио подключается отдельно.")
+    name = st.text_input("Имя клиента")
+    phone, phone_error = phone_input()
+    try:
+        normalized_phone = normalize_masked_phone(phone)
+    except ValueError as error:
+        normalized_phone = ""
+        phone_error = str(error)
+        st.error(phone_error)
+    uploaded = st.file_uploader("Запись разговора", type=["mp3", "wav", "m4a"])
+    c1, c2 = st.columns(2)
+    day = c1.date_input("Дата звонка", now.date())
+    clock = c2.time_input("Время звонка", now.time().replace(second=0, microsecond=0))
+    consent = st.checkbox("Подтверждаю, что имею право обрабатывать эту запись")
+    st.caption("Результат анализа сохраняется только в CallMind. Для отправки в CRM или календарь откройте договорённость, подтвердите данные и выберите перенос.")
+    if uploaded:
+        st.audio(uploaded)
+        if st.button("Анализировать разговор", type="primary", disabled=not consent or bool(phone_error)):
+            path = None
+            try:
+                if uploaded.size > 50 * 1024 * 1024:
+                    raise ValueError("Размер записи должен быть не больше 50 МБ")
+                if not name.strip() and not phone.strip():
+                    raise ValueError("Укажите имя или телефон клиента")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as file:
+                    file.write(uploaded.getbuffer())
+                    path = file.name
+                with st.status("Обрабатываем запись", expanded=True) as status:
+                    st.write("Распознаём речь")
+                    from services.transcription import transcribe_audio
+                    transcription = transcribe_audio(path)
+                    if not transcription["text"].strip():
+                        raise ValueError("Речь не обнаружена. Проверьте запись.")
+                    st.write("Определяем договорённости")
+                    from services.llm import analyze_call
+                    dt = datetime.combine(day, clock)
+                    analysis = analyze_call(transcription, dt)
+                    call_id = save_call(name, normalized_phone, dt, uploaded.name, path, transcription, analysis)
+                    st.session_state["last_call_id"] = call_id
+                    invalidate_risks()
+                    status.update(label="Звонок сохранён", state="complete")
+            except Exception as error:
+                st.error(str(error) if isinstance(error, ValueError) else "Не удалось обработать запись. Проверьте настройки AI и повторите.")
+            finally:
+                if path:
+                    Path(path).unlink(missing_ok=True)
+    if st.session_state.get("last_call_id"):
+        call = get_call(st.session_state["last_call_id"])
+        if call:
+            render_call(call, "new")
+
+elif page == "Клиенты":
+    st.title("Клиенты")
+    query = st.text_input("Поиск клиента").casefold().strip()
+    from services import crm
+    from frontend.crm import STATES
+    clients = [{**c, **crm.client_data(c["id"])} for c in get_clients()]
+    clients = [c for c in clients if query in f"{c['name']} {c['phone'] or ''} {c['email']}".casefold()]
+    if not clients:
+        st.info("Клиенты не найдены")
+    else:
+        with st.expander("Список клиентов · контакты и состояние CRM"):
+            st.dataframe([{"Клиент": c["name"], "Телефон": display_phone(c["phone"]), "Email": c["email"],
+                "Компания CRM, ID": c["company_id"], "Менеджер CRM, ID": c["manager_id"],
+                "Состояние CRM": ", ".join(STATES.get(r["state"], r["state"]) for r in crm.bindings("contact", c["id"])) or "Не перенесён"}
+                for c in clients], hide_index=True, use_container_width=True)
+        by_id = {c["id"]: c for c in clients}
+        client_id = st.selectbox("Клиент", list(by_id), index=list(by_id).index(st.session_state.get("focused_client")) if st.session_state.get("focused_client") in by_id else 0, format_func=lambda i: f"{by_id[i]['name']} · {display_phone(by_id[i]['phone']) or 'без телефона'} · #{i}")
+        calls = get_client_calls(client_id)
+        st.subheader(by_id[client_id]["name"])
+        st.caption(f"Звонков: {len(calls)}")
+        from frontend.crm import client_panel
+        client_panel(client_id)
+        with st.expander("История правок клиента"):
+            render_history("client", client_id)
+        if st.button("Проверить риски истории", disabled=not calls):
+            try:
+                with st.spinner("Анализируем историю"):
+                    from services.llm import analyze_client_history
+                    st.session_state[f"risk_{client_id}"] = analyze_client_history(calls, now)
+            except Exception:
+                st.error("Не удалось проанализировать историю. Проверьте подключение AI.")
+        risk = st.session_state.get(f"risk_{client_id}")
+        if risk:
+            (st.warning if risk.has_risk else st.success)(risk.summary)
+            for item in risk.risks:
+                st.write(item.title)
+                st.write(item.explanation)
+                for evidence in item.evidence:
+                    st.write(evidence)
+        for call in reversed(calls):
+            with st.expander(fmt(call["call_datetime"])):
+                render_call(call, "client")
+
+elif page == "Звонки":
+    st.title("История звонков")
+    if st.session_state.get("focused_call"):
+        call = get_call(st.session_state.focused_call)
+        st.button("← Все звонки", on_click=lambda: st.session_state.update(focused_call=None))
+        if call:
+            render_call(call, "focused")
+        st.stop()
+    query = st.text_input("Поиск по клиенту, резюме или транскрипции").casefold().strip()
+    calls = get_recent_calls(limit=1000)
+    c1, c2 = st.columns(2)
+    start = c1.date_input("С даты", min((c["call_datetime"].date() for c in calls), default=now.date()))
+    end = c2.date_input("По дату", now.date())
+    if start > end:
+        st.error("Начальная дата должна быть не позже конечной")
+    calls = [c for c in calls if start <= c["call_datetime"].date() <= end and query in f"{c['client_name']} {c['summary']} {c['transcript']}".casefold()]
+    st.caption(f"Найдено: {len(calls)}. Поиск по последним 1000 звонкам.")
+    index = st.number_input("Страница", min_value=1, max_value=max(1, (len(calls) + 9) // 10), value=1)
+    for call in calls[(index - 1) * 10:index * 10]:
+        with st.expander(f"{call['client_name']} · {fmt(call['call_datetime'])}"):
+            render_call(call, "history")
+
+elif page == "Настройки":
+    st.title("Настройки")
+    from frontend.connections import connection_panel
+    connection_panel()
+    st.subheader("Правила задач и напоминаний")
+    with st.form("preferences"):
+        tz = st.selectbox("Часовой пояс", [settings["timezone"], *[t for t in ["Europe/Minsk", "Europe/Moscow", "UTC"] if t != settings["timezone"]]])
+        priority = st.selectbox("Приоритет новых задач", list(PRIORITY), index=list(PRIORITY).index(settings["default_priority"]), format_func=PRIORITY.get)
+        template = st.text_input("Заголовок задачи Bitrix24", settings["task_template"], help="Доступны {description} и {client}")
+        calendar = st.text_input("Google Calendar ID", settings["calendar_id"])
+        reminder = st.number_input("Напомнить за, минут", min_value=1, max_value=1440, value=settings["reminder_minutes"])
+        duration = st.number_input("Длительность встречи, минут", min_value=1, max_value=1440, value=settings["event_minutes"])
+        crm_auto = st.checkbox("Автоматически синхронизировать связанные записи Bitrix24", value=settings["crm_auto_sync"])
+        calendar_auto = st.checkbox("Автоматически сверять связанные события Google Calendar", value=settings["calendar_auto_sync"])
+        st.caption("Первый перенос — после подтверждения и отдельного нажатия «Перенос». Автосинхронизация касается только связанных записей. CRM и Google включаются отдельно. Изменённое действие или срок перед отправкой нужно подтвердить. Разные правки одного поля требуют выбора. Отмена события Google не закрывает задачу или сделку.")
+        st.caption("Bitrix24 обновит название, срок, приоритет и статус задачи выбранного исполнителя CRM. Google Calendar: встреча занимает время; задача — напоминание без занятости. Без срока не отправляется. Данные клиента и цитата передаются, запись не передаётся.")
+        if st.form_submit_button("Сохранить настройки", type="primary"):
+            try:
+                save_settings(dict(timezone=tz, default_priority=priority, task_template=template,
+                    calendar_id=calendar, reminder_minutes=reminder, event_minutes=duration, auto_sync=False, crm_auto_sync=crm_auto, calendar_auto_sync=calendar_auto))
+                st.rerun()
+            except (ValueError, KeyError) as error:
+                st.error(str(error))
+    st.caption("Напоминания доставляет Google Calendar. Для событий на весь день время уведомления определяется календарём.")
+    from frontend.crm import settings_status
+    settings_status()
+    from frontend.calendar_sync import settings_status as calendar_settings_status
+    calendar_settings_status()
+    st.warning("Автоматическое получение звонков, обработка во время разговора и корпоративные права доступа пока не подключены.")
